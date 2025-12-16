@@ -43,10 +43,11 @@ type Pool struct {
 	tlsConfig    *tls.Config                       // TLS配置
 	addrResolver func() (string, error)            // 地址解析器
 	listenAddr   string                            // 监听地址
+	baseListener net.Listener                      // 基础TCP监听器
 	h2Conn       atomic.Pointer[net.Conn]          // HTTP/2底层连接
 	h2Client     atomic.Pointer[*http2.ClientConn] // HTTP/2客户端连接
 	h2Server     *http2.Server                     // HTTP/2服务器
-	listener     atomic.Pointer[net.Listener]      // TCP监听器
+	listener     atomic.Pointer[net.Listener]      // 监听器
 	first        atomic.Bool                       // 首次标志
 	errCount     atomic.Int32                      // 错误计数
 	capacity     atomic.Int32                      // 当前容量
@@ -114,36 +115,21 @@ func (s *StreamConn) ConnectionState() tls.ConnectionState {
 // buildTLSConfig 构建TLS配置
 func buildTLSConfig(tlsCode, hostname string) *tls.Config {
 	switch tlsCode {
-	case "0", "1":
-		// 使用自签名证书（不验证）
-		return &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"h2"},
-			MinVersion:         tls.VersionTLS12,
-		}
 	case "2":
 		// 使用验证证书（安全模式）
 		return &tls.Config{
 			InsecureSkipVerify: false,
 			ServerName:         hostname,
 			NextProtos:         []string{"h2"},
-			MinVersion:         tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS13,
 		}
 	default:
-		// 默认使用不验证模式
+		// 使用自签名证书（不验证）
 		return &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"h2"},
-			MinVersion:         tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS13,
 		}
-	}
-}
-
-// buildHTTP2ServerConfig 构建HTTP/2服务器配置
-func buildHTTP2ServerConfig(maxStreams int) *http2.Server {
-	return &http2.Server{
-		MaxConcurrentStreams: uint32(maxStreams),
-		IdleTimeout:          0, // 由keep-alive控制
 	}
 }
 
@@ -199,13 +185,13 @@ func NewServerPool(
 	maxCap int,
 	clientIP string,
 	tlsConfig *tls.Config,
-	listenAddr string,
+	baseListener net.Listener,
 	keepAlive time.Duration,
 ) *Pool {
 	if maxCap <= 0 {
 		maxCap = defaultMaxCap
 	}
-	if listenAddr == "" {
+	if baseListener == nil {
 		return nil
 	}
 	if tlsConfig == nil {
@@ -217,14 +203,17 @@ func NewServerPool(
 	tlsConfig.MinVersion = tls.VersionTLS12
 
 	pool := &Pool{
-		streams:    sync.Map{},
-		idChan:     make(chan string, maxCap),
-		clientIP:   clientIP,
-		tlsConfig:  tlsConfig,
-		listenAddr: listenAddr,
-		maxCap:     maxCap,
-		keepAlive:  keepAlive,
-		h2Server:   buildHTTP2ServerConfig(maxCap),
+		streams:      sync.Map{},
+		idChan:       make(chan string, maxCap),
+		clientIP:     clientIP,
+		tlsConfig:    tlsConfig,
+		baseListener: baseListener,
+		listenAddr:   baseListener.Addr().String(),
+		maxCap:       maxCap,
+		keepAlive:    keepAlive,
+		h2Server: &http2.Server{
+			MaxConcurrentStreams: uint32(maxCap),
+		},
 	}
 	pool.ctx, pool.cancel = context.WithCancel(context.Background())
 	return pool
@@ -234,8 +223,7 @@ func NewServerPool(
 type http2Stream struct {
 	reader io.ReadCloser
 	writer io.WriteCloser
-	mu     sync.Mutex
-	closed bool
+	closed atomic.Bool
 }
 
 func (s *http2Stream) Read(p []byte) (n int, err error) {
@@ -247,12 +235,9 @@ func (s *http2Stream) Write(p []byte) (n int, err error) {
 }
 
 func (s *http2Stream) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed = true
 	if s.reader != nil {
 		s.reader.Close()
 	}
@@ -264,14 +249,21 @@ func (s *http2Stream) Close() error {
 
 // createStream 创建新的客户端流
 func (p *Pool) createStream() bool {
-	conn := p.h2Conn.Load()
 	client := p.h2Client.Load()
-	if conn == nil || client == nil || *client == nil {
+	if client == nil || *client == nil {
 		return false
 	}
 
 	// 创建管道对用于双向通信
 	reqReader, reqWriter := io.Pipe()
+	defer func() {
+		if reqWriter != nil {
+			reqWriter.Close()
+		}
+		if reqReader != nil {
+			reqReader.Close()
+		}
+	}()
 
 	// 创建HTTP/2请求
 	req := &http.Request{
@@ -297,33 +289,24 @@ func (p *Pool) createStream() bool {
 		respChan <- resp
 	}()
 
+	// 立即发送握手字节
+	if _, err := reqWriter.Write([]byte{0x00}); err != nil {
+		return false
+	}
+
+	// 等待响应
 	var resp *http.Response
 	select {
 	case resp = <-respChan:
 	case <-errChan:
-		reqWriter.Close()
-		reqReader.Close()
 		return false
 	case <-ctx.Done():
-		reqWriter.Close()
-		reqReader.Close()
-		return false
-	}
-
-	// 发送握手字节
-	if _, err := reqWriter.Write([]byte{0x00}); err != nil {
-		reqWriter.Close()
-		reqReader.Close()
-		resp.Body.Close()
 		return false
 	}
 
 	// 接收流ID
 	buf := make([]byte, 4)
-	n, err := io.ReadFull(resp.Body, buf)
-	if err != nil || n != 4 {
-		reqWriter.Close()
-		reqReader.Close()
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
 		resp.Body.Close()
 		return false
 	}
@@ -336,12 +319,13 @@ func (p *Pool) createStream() bool {
 	}
 
 	// 建立映射并存入通道
-	p.streams.Store(id, stream)
 	select {
 	case p.idChan <- id:
+		p.streams.Store(id, stream)
+		reqWriter = nil
+		reqReader = nil
 		return true
 	default:
-		p.streams.Delete(id)
 		stream.Close()
 		return false
 	}
@@ -349,15 +333,15 @@ func (p *Pool) createStream() bool {
 
 // handleStream 处理新的服务端流
 func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
-	// 检查池是否已满
-	if p.Active() >= p.maxCap {
-		http.Error(rw, "pool full", http.StatusServiceUnavailable)
+	// 检查路径、方法和池容量
+	if req.URL.Path != "/stream" || req.Method != "POST" || p.Active() >= p.maxCap {
+		http.Error(rw, "not found", http.StatusNotFound)
 		return
 	}
 
 	// 读取握手字节
-	handshake := make([]byte, 1)
-	if _, err := req.Body.Read(handshake); err != nil {
+	var handshake [1]byte
+	if _, err := req.Body.Read(handshake[:]); err != nil {
 		return
 	}
 
@@ -367,29 +351,23 @@ func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// 防止重复流ID
+	// 防止重复流ID并发送ID
 	if _, exist := p.streams.Load(id); exist {
 		return
 	}
-
-	// 发送流ID给客户端
 	if _, err := rw.Write(rawID); err != nil {
 		return
 	}
-
-	// Flush响应头
 	if flusher, ok := rw.(http.Flusher); ok {
 		flusher.Flush()
 	}
 
-	// 创建双向流
-	respWriter := &responseWriter{rw: rw}
+	// 创建双向流并尝试放入通道
 	stream := &http2Stream{
 		reader: req.Body,
-		writer: respWriter,
+		writer: &responseWriter{rw: rw},
 	}
 
-	// 尝试放入通道
 	select {
 	case p.idChan <- id:
 		p.streams.Store(id, stream)
@@ -397,19 +375,21 @@ func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
 		stream.Close()
 		return
 	}
+
+	// 保持流打开直到上下文取消
+	<-p.ctx.Done()
+	p.streams.Delete(id)
+	stream.Close()
 }
 
 // responseWriter 包装http.ResponseWriter为io.WriteCloser
 type responseWriter struct {
 	rw     http.ResponseWriter
-	closed bool
-	mu     sync.Mutex
+	closed atomic.Bool
 }
 
 func (w *responseWriter) Write(p []byte) (n int, err error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed {
+	if w.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 	n, err = w.rw.Write(p)
@@ -420,9 +400,7 @@ func (w *responseWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w *responseWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.closed = true
+	w.closed.Store(true)
 	return nil
 }
 
@@ -431,7 +409,6 @@ func (p *Pool) establishConnection() error {
 	existingConn := p.h2Conn.Load()
 	client := p.h2Client.Load()
 	if existingConn != nil && client != nil && *client != nil {
-		// 检查连接是否仍然有效
 		if err := (*client).Ping(p.ctx); err == nil {
 			return nil
 		}
@@ -468,19 +445,15 @@ func (p *Pool) establishConnection() error {
 
 // startListener 启动HTTP/2监听器
 func (p *Pool) startListener() error {
-	if p.listener.Load() != nil {
-		return nil
-	}
 	if p.tlsConfig == nil {
 		return fmt.Errorf("startListener: TLS config is required")
 	}
-
-	listener, err := tls.Listen("tcp", p.listenAddr, p.tlsConfig)
-	if err != nil {
-		return fmt.Errorf("startListener: %w", err)
+	if p.baseListener == nil {
+		return fmt.Errorf("startListener: base listener is required")
 	}
 
-	p.listener.Store(&listener)
+	var l net.Listener = p.baseListener
+	p.listener.Store(&l)
 	return nil
 }
 
@@ -498,7 +471,6 @@ func (p *Pool) ClientManager() {
 		created := 0
 
 		if need > 0 {
-			// 确保连接已建立
 			if err := p.establishConnection(); err != nil {
 				time.Sleep(acceptRetryInterval)
 				continue
@@ -537,7 +509,6 @@ func (p *Pool) ServerManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// 启动TCP监听器
 	if err := p.startListener(); err != nil {
 		return
 	}
@@ -549,24 +520,17 @@ func (p *Pool) ServerManager() {
 
 	// HTTP处理器
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 验证客户端IP
 		if p.clientIP != "" {
-			host, _, _ := net.SplitHostPort(r.RemoteAddr)
-			if host != p.clientIP {
-				http.Error(w, "unauthorized IP", http.StatusForbidden)
+			if host, _, _ := net.SplitHostPort(r.RemoteAddr); host != p.clientIP {
+				http.Error(w, "unauthorized", http.StatusForbidden)
 				return
 			}
 		}
 		p.handleStream(w, r)
 	})
 
-	// 创建HTTP服务器
-	server := &http.Server{
-		Handler: handler,
-	}
-
 	// 配置HTTP/2
-	if err := http2.ConfigureServer(server, p.h2Server); err != nil {
+	if err := http2.ConfigureServer(&http.Server{Handler: handler}, p.h2Server); err != nil {
 		return
 	}
 
@@ -577,16 +541,26 @@ func (p *Pool) ServerManager() {
 			if p.ctx.Err() != nil {
 				return
 			}
-			select {
-			case <-p.ctx.Done():
-				return
-			case <-time.After(acceptRetryInterval):
-			}
+			time.Sleep(acceptRetryInterval)
 			continue
 		}
 
-		// 存储连接并处理
-		p.h2Conn.Store(&conn)
+		// TLS包装和握手
+		tlsConn := tls.Server(conn, p.tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			continue
+		}
+
+		// 验证ALPN
+		if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+			tlsConn.Close()
+			continue
+		}
+
+		// 处理连接
+		netConn := net.Conn(tlsConn)
+		p.h2Conn.Store(&netConn)
 
 		go func(c net.Conn) {
 			defer c.Close()
@@ -594,7 +568,7 @@ func (p *Pool) ServerManager() {
 				Context: p.ctx,
 				Handler: handler,
 			})
-		}(conn)
+		}(tlsConn)
 	}
 }
 
@@ -603,23 +577,25 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
 
+	ticker := time.NewTicker(idRetryInterval)
+	defer ticker.Stop()
+
 	for {
 		if stream, ok := p.streams.LoadAndDelete(id); ok {
 			<-p.idChan
-			conn := p.h2Conn.Load()
-			if conn == nil {
-				return nil, fmt.Errorf("OutgoingGet: connection not available")
+			if conn := p.h2Conn.Load(); conn != nil {
+				return &StreamConn{
+					ReadWriteCloser: stream.(io.ReadWriteCloser),
+					conn:            *conn,
+					localAddr:       (*conn).LocalAddr(),
+					remoteAddr:      (*conn).RemoteAddr(),
+				}, nil
 			}
-			return &StreamConn{
-				ReadWriteCloser: stream.(io.ReadWriteCloser),
-				conn:            *conn,
-				localAddr:       (*conn).LocalAddr(),
-				remoteAddr:      (*conn).RemoteAddr(),
-			}, nil
+			return nil, fmt.Errorf("OutgoingGet: connection not available")
 		}
 
 		select {
-		case <-time.After(idRetryInterval):
+		case <-ticker.C:
 		case <-ctx.Done():
 			return nil, fmt.Errorf("OutgoingGet: stream not found")
 		}
@@ -637,18 +613,15 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 			return "", nil, fmt.Errorf("IncomingGet: insufficient streams")
 		case id := <-p.idChan:
 			if stream, ok := p.streams.LoadAndDelete(id); ok {
-				conn := p.h2Conn.Load()
-				if conn == nil {
-					continue
+				if conn := p.h2Conn.Load(); conn != nil {
+					return id, &StreamConn{
+						ReadWriteCloser: stream.(io.ReadWriteCloser),
+						conn:            *conn,
+						localAddr:       (*conn).LocalAddr(),
+						remoteAddr:      (*conn).RemoteAddr(),
+					}, nil
 				}
-				return id, &StreamConn{
-					ReadWriteCloser: stream.(io.ReadWriteCloser),
-					conn:            *conn,
-					localAddr:       (*conn).LocalAddr(),
-					remoteAddr:      (*conn).RemoteAddr(),
-				}, nil
 			}
-			continue
 		}
 	}
 }
