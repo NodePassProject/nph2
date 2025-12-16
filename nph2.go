@@ -200,7 +200,7 @@ func NewServerPool(
 
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{"h2"}
-	tlsConfig.MinVersion = tls.VersionTLS12
+	tlsConfig.MinVersion = tls.VersionTLS13
 
 	pool := &Pool{
 		streams:      sync.Map{},
