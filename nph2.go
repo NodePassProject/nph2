@@ -371,6 +371,10 @@ func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
 	select {
 	case p.idChan <- id:
 		p.streams.Store(id, stream)
+		defer func() {
+			p.streams.Delete(id)
+			stream.Close()
+		}()
 	default:
 		stream.Close()
 		return
@@ -378,8 +382,6 @@ func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
 
 	// 保持流打开直到上下文取消
 	<-p.ctx.Done()
-	p.streams.Delete(id)
-	stream.Close()
 }
 
 // responseWriter 包装http.ResponseWriter为io.WriteCloser
