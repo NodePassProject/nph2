@@ -213,6 +213,7 @@ func NewServerPool(
 		keepAlive:    keepAlive,
 		h2Server: &http2.Server{
 			MaxConcurrentStreams: uint32(maxCap),
+			IdleTimeout:          keepAlive * 2,
 		},
 	}
 	pool.ctx, pool.cancel = context.WithCancel(context.Background())
@@ -465,6 +466,23 @@ func (p *Pool) ClientManager() {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+
+	if p.keepAlive > 0 {
+		go func() {
+			ticker := time.NewTicker(p.keepAlive)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if client := p.h2Client.Load(); client != nil && *client != nil {
+						(*client).Ping(p.ctx)
+					}
+				case <-p.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	for p.ctx.Err() == nil {
 		p.adjustInterval()
