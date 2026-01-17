@@ -1,4 +1,3 @@
-// Package nph2 实现了基于HTTP/2协议的高性能、可靠的网络流管理系统
 package nph2
 
 import (
@@ -33,35 +32,33 @@ const (
 	intervalHighThreshold   = 0.8
 )
 
-// Pool HTTP/2流池结构体，用于管理HTTP/2流
 type Pool struct {
-	streams      sync.Map                          // 存储流的映射表
-	idChan       chan string                       // 可用流ID通道
-	tlsCode      string                            // TLS安全模式代码
-	hostname     string                            // 主机名
-	clientIP     string                            // 客户端IP
-	tlsConfig    *tls.Config                       // TLS配置
-	addrResolver func() (string, error)            // 地址解析器
-	listenAddr   string                            // 监听地址
-	baseListener net.Listener                      // 基础TCP监听器
-	h2Conn       atomic.Pointer[net.Conn]          // HTTP/2底层连接
-	h2Client     atomic.Pointer[*http2.ClientConn] // HTTP/2客户端连接
-	h2Server     *http2.Server                     // HTTP/2服务器
-	listener     atomic.Pointer[net.Listener]      // 监听器
-	first        atomic.Bool                       // 首次标志
-	errCount     atomic.Int32                      // 错误计数
-	capacity     atomic.Int32                      // 当前容量
-	minCap       int                               // 最小容量
-	maxCap       int                               // 最大容量
-	interval     atomic.Int64                      // 流创建间隔
-	minIvl       time.Duration                     // 最小间隔
-	maxIvl       time.Duration                     // 最大间隔
-	keepAlive    time.Duration                     // 保活间隔
-	ctx          context.Context                   // 上下文
-	cancel       context.CancelFunc                // 取消函数
+	streams      sync.Map
+	idChan       chan string
+	tlsCode      string
+	hostname     string
+	clientIP     string
+	tlsConfig    *tls.Config
+	addrResolver func() (string, error)
+	listenAddr   string
+	baseListener net.Listener
+	h2Conn       atomic.Pointer[net.Conn]
+	h2Client     atomic.Pointer[*http2.ClientConn]
+	h2Server     *http2.Server
+	listener     atomic.Pointer[net.Listener]
+	first        atomic.Bool
+	errCount     atomic.Int32
+	capacity     atomic.Int32
+	minCap       int
+	maxCap       int
+	interval     atomic.Int64
+	minIvl       time.Duration
+	maxIvl       time.Duration
+	keepAlive    time.Duration
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
-// StreamConn 将HTTP/2流包装为net.Conn接口
 type StreamConn struct {
 	io.ReadWriteCloser
 	conn       net.Conn
@@ -69,26 +66,21 @@ type StreamConn struct {
 	remoteAddr net.Addr
 }
 
-// LocalAddr 返回本地地址
 func (s *StreamConn) LocalAddr() net.Addr {
 	return s.localAddr
 }
 
-// RemoteAddr 返回远程地址
 func (s *StreamConn) RemoteAddr() net.Addr {
 	return s.remoteAddr
 }
 
-// SetDeadline 设置读写截止时间
 func (s *StreamConn) SetDeadline(t time.Time) error {
-	// HTTP/2流不支持单独的deadline，使用底层连接的
 	if tc, ok := s.conn.(interface{ SetDeadline(time.Time) error }); ok {
 		return tc.SetDeadline(t)
 	}
 	return nil
 }
 
-// SetReadDeadline 设置读取截止时间
 func (s *StreamConn) SetReadDeadline(t time.Time) error {
 	if tc, ok := s.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
 		return tc.SetReadDeadline(t)
@@ -96,7 +88,6 @@ func (s *StreamConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline 设置写入截止时间
 func (s *StreamConn) SetWriteDeadline(t time.Time) error {
 	if tc, ok := s.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		return tc.SetWriteDeadline(t)
@@ -104,7 +95,6 @@ func (s *StreamConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// ConnectionState 返回TLS状态
 func (s *StreamConn) ConnectionState() tls.ConnectionState {
 	if tc, ok := s.conn.(*tls.Conn); ok {
 		return tc.ConnectionState()
@@ -112,11 +102,9 @@ func (s *StreamConn) ConnectionState() tls.ConnectionState {
 	return tls.ConnectionState{}
 }
 
-// buildTLSConfig 构建TLS配置
 func buildTLSConfig(tlsCode, hostname string) *tls.Config {
 	switch tlsCode {
 	case "2":
-		// 使用验证证书（安全模式）
 		return &tls.Config{
 			InsecureSkipVerify: false,
 			ServerName:         hostname,
@@ -124,7 +112,6 @@ func buildTLSConfig(tlsCode, hostname string) *tls.Config {
 			MinVersion:         tls.VersionTLS13,
 		}
 	default:
-		// 使用自签名证书（不验证）
 		return &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"h2"},
@@ -133,7 +120,6 @@ func buildTLSConfig(tlsCode, hostname string) *tls.Config {
 	}
 }
 
-// NewClientPool 创建新的客户端HTTP/2池
 func NewClientPool(
 	minCap, maxCap int,
 	minIvl, maxIvl time.Duration,
@@ -180,7 +166,6 @@ func NewClientPool(
 	return pool
 }
 
-// NewServerPool 创建新的服务端HTTP/2池
 func NewServerPool(
 	maxCap int,
 	clientIP string,
@@ -220,7 +205,6 @@ func NewServerPool(
 	return pool
 }
 
-// http2Stream 双向流实现
 type http2Stream struct {
 	reader io.ReadCloser
 	writer io.WriteCloser
@@ -248,14 +232,12 @@ func (s *http2Stream) Close() error {
 	return nil
 }
 
-// createStream 创建新的客户端流
 func (p *Pool) createStream() bool {
 	client := p.h2Client.Load()
 	if client == nil || *client == nil {
 		return false
 	}
 
-	// 创建管道对用于双向通信
 	reqReader, reqWriter := io.Pipe()
 	defer func() {
 		if reqWriter != nil {
@@ -266,7 +248,6 @@ func (p *Pool) createStream() bool {
 		}
 	}()
 
-	// 创建HTTP/2请求
 	req := &http.Request{
 		Method: "POST",
 		URL:    &url.URL{Scheme: "https", Host: p.hostname, Path: "/stream"},
@@ -274,7 +255,6 @@ func (p *Pool) createStream() bool {
 		Body:   reqReader,
 	}
 
-	// 发送请求并获取响应
 	ctx, cancel := context.WithTimeout(p.ctx, idReadTimeout)
 	defer cancel()
 
@@ -290,12 +270,10 @@ func (p *Pool) createStream() bool {
 		respChan <- resp
 	}()
 
-	// 立即发送握手字节
 	if _, err := reqWriter.Write([]byte{0x00}); err != nil {
 		return false
 	}
 
-	// 等待响应
 	var resp *http.Response
 	select {
 	case resp = <-respChan:
@@ -305,7 +283,6 @@ func (p *Pool) createStream() bool {
 		return false
 	}
 
-	// 接收流ID
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(resp.Body, buf); err != nil {
 		resp.Body.Close()
@@ -313,13 +290,11 @@ func (p *Pool) createStream() bool {
 	}
 	id := hex.EncodeToString(buf)
 
-	// 创建双向流
 	stream := &http2Stream{
 		reader: resp.Body,
 		writer: reqWriter,
 	}
 
-	// 建立映射并存入通道
 	select {
 	case p.idChan <- id:
 		p.streams.Store(id, stream)
@@ -332,27 +307,22 @@ func (p *Pool) createStream() bool {
 	}
 }
 
-// handleStream 处理新的服务端流
 func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
-	// 检查路径、方法和池容量
 	if req.URL.Path != "/stream" || req.Method != "POST" || p.Active() >= p.maxCap {
 		http.Error(rw, "not found", http.StatusNotFound)
 		return
 	}
 
-	// 读取握手字节
 	var handshake [1]byte
 	if _, err := req.Body.Read(handshake[:]); err != nil {
 		return
 	}
 
-	// 生成流ID
 	rawID, id, err := p.generateID()
 	if err != nil {
 		return
 	}
 
-	// 防止重复流ID并发送ID
 	if _, exist := p.streams.Load(id); exist {
 		return
 	}
@@ -363,7 +333,6 @@ func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
 		flusher.Flush()
 	}
 
-	// 创建双向流并尝试放入通道
 	stream := &http2Stream{
 		reader: req.Body,
 		writer: &responseWriter{rw: rw},
@@ -381,11 +350,9 @@ func (p *Pool) handleStream(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// 保持流打开直到上下文取消
 	<-p.ctx.Done()
 }
 
-// responseWriter 包装http.ResponseWriter为io.WriteCloser
 type responseWriter struct {
 	rw     http.ResponseWriter
 	closed atomic.Bool
@@ -407,7 +374,6 @@ func (w *responseWriter) Close() error {
 	return nil
 }
 
-// establishConnection 建立HTTP/2连接
 func (p *Pool) establishConnection() error {
 	existingConn := p.h2Conn.Load()
 	client := p.h2Client.Load()
@@ -426,13 +392,11 @@ func (p *Pool) establishConnection() error {
 
 	tlsConfig := buildTLSConfig(p.tlsCode, p.hostname)
 
-	// 建立TLS连接
 	tlsConn, err := tls.Dial("tcp", targetAddr, tlsConfig)
 	if err != nil {
 		return err
 	}
 
-	// 创建HTTP/2传输层
 	transport := &http2.Transport{}
 	h2Client, err := transport.NewClientConn(tlsConn)
 	if err != nil {
@@ -446,7 +410,6 @@ func (p *Pool) establishConnection() error {
 	return nil
 }
 
-// startListener 启动HTTP/2监听器
 func (p *Pool) startListener() error {
 	if p.tlsConfig == nil {
 		return fmt.Errorf("startListener: TLS config is required")
@@ -460,7 +423,6 @@ func (p *Pool) startListener() error {
 	return nil
 }
 
-// ClientManager 客户端HTTP/2池管理器
 func (p *Pool) ClientManager() {
 	if p.cancel != nil {
 		p.cancel()
@@ -522,7 +484,6 @@ func (p *Pool) ClientManager() {
 	}
 }
 
-// ServerManager 服务端HTTP/2池管理器
 func (p *Pool) ServerManager() {
 	if p.cancel != nil {
 		p.cancel()
@@ -538,7 +499,6 @@ func (p *Pool) ServerManager() {
 		return
 	}
 
-	// HTTP处理器
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if p.clientIP != "" {
 			if host, _, _ := net.SplitHostPort(r.RemoteAddr); host != p.clientIP {
@@ -549,12 +509,10 @@ func (p *Pool) ServerManager() {
 		p.handleStream(w, r)
 	})
 
-	// 配置HTTP/2
 	if err := http2.ConfigureServer(&http.Server{Handler: handler}, p.h2Server); err != nil {
 		return
 	}
 
-	// 接受连接
 	for p.ctx.Err() == nil {
 		conn, err := (*listener).Accept()
 		if err != nil {
@@ -565,20 +523,17 @@ func (p *Pool) ServerManager() {
 			continue
 		}
 
-		// TLS包装和握手
 		tlsConn := tls.Server(conn, p.tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
 			continue
 		}
 
-		// 验证ALPN
 		if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
 			tlsConn.Close()
 			continue
 		}
 
-		// 处理连接
 		netConn := net.Conn(tlsConn)
 		p.h2Conn.Store(&netConn)
 
@@ -592,7 +547,6 @@ func (p *Pool) ServerManager() {
 	}
 }
 
-// OutgoingGet 根据ID获取可用流
 func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
@@ -622,7 +576,6 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	}
 }
 
-// IncomingGet 获取可用流并返回ID
 func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
@@ -646,7 +599,6 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	}
 }
 
-// Flush 清空池中的所有流
 func (p *Pool) Flush() {
 	var wg sync.WaitGroup
 	p.streams.Range(func(key, value any) bool {
@@ -663,7 +615,6 @@ func (p *Pool) Flush() {
 	p.idChan = make(chan string, p.maxCap)
 }
 
-// Close 关闭连接池并释放资源
 func (p *Pool) Close() {
 	if p.cancel != nil {
 		p.cancel()
@@ -678,42 +629,34 @@ func (p *Pool) Close() {
 	}
 }
 
-// Ready 检查连接池是否已初始化
 func (p *Pool) Ready() bool {
 	return p.ctx != nil
 }
 
-// Active 获取当前活跃流数
 func (p *Pool) Active() int {
 	return len(p.idChan)
 }
 
-// Capacity 获取当前池容量
 func (p *Pool) Capacity() int {
 	return int(p.capacity.Load())
 }
 
-// Interval 获取当前流创建间隔
 func (p *Pool) Interval() time.Duration {
 	return time.Duration(p.interval.Load())
 }
 
-// AddError 增加错误计数
 func (p *Pool) AddError() {
 	p.errCount.Add(1)
 }
 
-// ErrorCount 获取错误计数
 func (p *Pool) ErrorCount() int {
 	return int(p.errCount.Load())
 }
 
-// ResetError 重置错误计数
 func (p *Pool) ResetError() {
 	p.errCount.Store(0)
 }
 
-// adjustInterval 根据池使用情况动态调整流创建间隔
 func (p *Pool) adjustInterval() {
 	idle := len(p.idChan)
 	capacity := int(p.capacity.Load())
@@ -730,7 +673,6 @@ func (p *Pool) adjustInterval() {
 	}
 }
 
-// adjustCapacity 根据创建成功率动态调整池容量
 func (p *Pool) adjustCapacity(created int) {
 	capacity := int(p.capacity.Load())
 	ratio := float64(created) / float64(capacity)
@@ -744,7 +686,6 @@ func (p *Pool) adjustCapacity(created int) {
 	}
 }
 
-// generateID 生成唯一流ID
 func (p *Pool) generateID() ([]byte, string, error) {
 	if p.first.CompareAndSwap(false, true) {
 		return []byte{0, 0, 0, 0}, "00000000", nil
